@@ -190,13 +190,16 @@ export function apply(ctx) {
 
   // Approval gate: durable effects (save / forget) ask the host approval
   // service; deployments without an approval channel deny them (fail closed).
-  ctx.on('tools/pre-execute', async (exec) => {
-    if (exec?.name !== 'memory') return undefined
+  // Waterfall contract: a listener that does not call next() vetoes the whole
+  // chain (including the default allow), so every pass-through MUST be
+  // `return next()` — never a bare `return`.
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    if (exec?.name !== 'memory') return next()
     const op = exec?.arguments?.operation
     if (op === 'save' || op === 'forget') {
       return { kind: 'ask', reason: `memory ${op}: durable cross-session effect on the memory store` }
     }
-    return undefined
+    return next()
   })
 
   // RPC bridge: expose list/save/forget/restore/purge to the browser half

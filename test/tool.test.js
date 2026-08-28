@@ -41,15 +41,21 @@ after(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
-test('approval gate asks for save and forget, stays silent otherwise', async () => {
+test('approval gate asks for save and forget, passes through otherwise', async () => {
   assert.ok(preExecuteHandler, 'pre-execute handler subscribed')
-  const ask = await preExecuteHandler({ name: 'memory', arguments: { operation: 'save' } })
+  // waterfall contract: pass-through is `return next()`, never undefined
+  // (a listener that skips next() vetoes the whole chain — see cordis events)
+  const pass = () => ({ kind: 'allow' })
+  const ask = await preExecuteHandler({ name: 'memory', arguments: { operation: 'save' } }, pass)
   assert.deepEqual(ask, { kind: 'ask', reason: 'memory save: durable cross-session effect on the memory store' })
-  const askForget = await preExecuteHandler({ name: 'memory', arguments: { operation: 'forget' } })
+  const askForget = await preExecuteHandler({ name: 'memory', arguments: { operation: 'forget' } }, pass)
   assert.equal(askForget.kind, 'ask')
-  assert.equal(await preExecuteHandler({ name: 'memory', arguments: { operation: 'recall' } }), undefined)
-  assert.equal(await preExecuteHandler({ name: 'memory', arguments: { operation: 'list' } }), undefined)
-  assert.equal(await preExecuteHandler({ name: 'other-tool', arguments: {} }), undefined)
+  assert.deepEqual(await preExecuteHandler({ name: 'memory', arguments: { operation: 'recall' } }, pass), { kind: 'allow' })
+  assert.deepEqual(await preExecuteHandler({ name: 'memory', arguments: { operation: 'list' } }, pass), { kind: 'allow' })
+  assert.deepEqual(await preExecuteHandler({ name: 'other-tool', arguments: {} }, pass), { kind: 'allow' })
+  // undefined pass-through (the veto bug this test guards against)
+  const vetoed = await preExecuteHandler({ name: 'other-tool', arguments: {} }, pass)
+  assert.notEqual(vetoed, undefined, 'must never return undefined — that vetoes the chain')
 })
 
 test('scope isolation: project A cannot see or forget project B entries', async () => {
