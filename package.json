@@ -1,0 +1,58 @@
+{
+  "name": "dsh-memory-lite",
+  "version": "0.1.0",
+  "description": "Lightweight cross-session memory for DeepSeek Harness: one `memory` tool with save/recall/list/forget operations plus a Settings-card UI, persisted to ~/.dsh/memory-lite.json.",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "agent-memory"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pacoyi/dsh-memory-lite.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pacoyi/dsh-memory-lite/issues"
+  },
+  "homepage": "https://github.com/pacoyi/dsh-memory-lite#readme",
+  "author": "pacoyi <pacoyi@yeah.net> (https://github.com/pacoyi)",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.0.1-rc.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ]
+}
