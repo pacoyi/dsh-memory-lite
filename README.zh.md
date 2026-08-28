@@ -1,6 +1,6 @@
 # dsh-memory-lite
 
-**[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的轻量跨会话记忆插件** —— 一个 `memory` 工具（save / recall / list / forget）+ 设置页"记忆库"卡片，持久化到一个人类可读的 JSON 文件。
+**[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的轻量跨会话记忆插件** —— 一个 `memory` 工具（save / recall / list / forget）+ 设置页"记忆库"卡片，带作用域隔离、写入审批、审计与崩溃安全存储。
 
 [English](README.md) | 中文
 
@@ -12,7 +12,7 @@ dsh 的每个会话都是白纸开局：转录落盘是为了审计，但模型�
 
 - **零依赖** —— 只用 Node 内置模块；peerDependencies 仅两个（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-tools`）。
 - **人类可读的存储** —— 一切都在 `~/.dsh/memory-lite.json`。可以直接打开、编辑、备份、删除。没有数据库，没有索引。
-- **一个工具四个操作** —— 没有模式开关，没有需要学习的配置面。
+- **受约束、可检视的效果** —— 作用域可见性、持久写入需审批、逐变更审计日志、模型可见内容的字节与条数预算。
 
 ## 安装
 
@@ -31,9 +31,39 @@ dsh plugin --profile web add file:./dsh-memory-lite
 
 重启 profile（`dsh --profile web`），`memory` 工具即生效。
 
+## 隐私 —— 存敏感内容前必读
+
+**存储文件在本地；被 recall 的内容不是仅本地的。**
+
+- 插件自身**零网络请求**、无遥测。
+- 但 `recall` / `list` 的结果是普通工具结果：会进入模型可见的会话表面、在下一个模型步骤**发送给你配置的模型提供方**，并与其他工具输出一样**持久化进 Session 日志**。
+- 因此：**不要**在本存储中存放凭证、API 密钥、客户数据、私有源码或认证材料。把它当作你会粘贴进聊天的内容来对待。
+- 每条被 recall 的条目在工具输出中都标注为 *untrusted evidence*（不可信证据）——可能过期的历史数据，永远不是指令来源。
+
+## 作用域与隔离
+
+- 记忆作用域从**宿主执行上下文**（agent 会话的工作目录）派生，绝不来自模型编写的参数。
+- `recall` / `list` / `forget` 只能看到当前项目作用域 + 显式存为 `global` 的条目——一个项目读不到也删不掉另一个项目的条目。
+- 设置页卡片展示全部作用域（人类主人拥有完整视野），手动记笔记时可选择归属。
+
+## 审批、幂等与审计
+
+- `save` 与 `forget` 请求**宿主审批**（`tools/pre-execute` → ask）。web profile 中会弹出标准审批卡片；未组装审批通道的部署会拒绝这两个操作（fail closed，安全失败）。
+- 重放同一工具调用（如会话恢复后）**不会产生重复**条目——save 按调用 id 去重。
+- 每次变更向 `~/.dsh/.memory-lite.audit.jsonl` 追加一条持久记录：时间戳、操作、条目 id、作用域、来源（`agent` 或手动）、结果。
+- `forget` 把条目移入**回收站**（可从设置卡片恢复）；永久删除是单独的、需确认的操作。
+
+## 存储耐久性
+
+- 所有变更经单一进程内队列 **+** 跨进程锁（原子 `mkdir` + PID 存活检测 + 陈旧接管）串行化——共享同一 OS home 的两个 host 不会丢写。
+- 写入原子发布：临时文件 → fsync → rename，前一代保留为 `.memory-lite.bak`，目录 fsync 尽力而为。
+- 损坏的存储被**隔离**（`.memory-lite.corrupt.json`），所有变更**安全失败**——损坏绝不悄悄降级为空库并覆盖你唯一的副本。
+- 条目 id 来自持久计数器，**永不复用**。
+- 预算：笔记 ≤ 2000 字符、标签 ≤ 8 个 × 32 字符、条目 ≤ 1000 条、文件 ≤ 512 KB、渲染输出 ≤ 16000 字符。
+
 ## 使用
 
-正常对话即可——模型自己决定何时存取：
+正常对话即可——模型自己决定何时存取（审批卡片会先问你）：
 
 > "记住：这个项目用 pnpm，不要用 npm"
 > "我之前跟你说过什么关于部署的事？"
@@ -43,33 +73,34 @@ dsh plugin --profile web add file:./dsh-memory-lite
 | 参数 | 适用操作 | 说明 |
 |---|---|---|
 | `operation` | 全部 | `save` \| `recall` \| `list` \| `forget` |
-| `note` | save | 要记住的内容——自包含、具体 |
+| `text` | save | 要记住的内容——自包含、具体，≤ 2000 字符 |
 | `tags` | save | 可选标签，如 `["preference", "project-x"]` |
 | `query` | recall | 关键字，对文本和标签做大小写不敏感匹配 |
 | `tag` | recall | 精确匹配携带该标签的条目 |
 | `limit` | list/recall | 返回条数上限（默认 10，最大 100） |
-| `id` | forget | 要删除的条目 id |
+| `id` | forget | 要移入回收站的条目 id |
 
 ## 设置页 UI
 
-web 客户端在**设置页**提供"记忆库"卡片：浏览最近条目（含时间戳与标签），一键删除任意条目。卡片能做的一切，直接编辑 `~/.dsh/memory-lite.json` 也都能做。
-
-## 数据与隐私
-
-- 存储位置：`~/.dsh/memory-lite.json`（首次 save 时创建）
-- 数据不出本机。无遥测、无网络请求。
-- 卸载插件或删除该文件——即彻底清除。
+web 客户端在**设置页**提供"记忆库"卡片：按作用域分组展示条目（含来源与时间戳）、两击确认删除、回收站视图（恢复 / 永久删除）。卡片能做的一切，直接编辑 `~/.dsh/memory-lite.json` 也都能做——但仅限 host 停止时，因为并发写归插件所有。
 
 ## 开发
 
 这是一个"双半"（two-half）dsh 插件：
 
-- `index.js` —— **agent 半**：在 Node 侧注册 `memory` 工具。
+- `index.js` —— **agent 半**：注册 `memory` 工具、审批门与浏览器 RPC 桥。
+- `storage.js` —— 存储引擎：锁、原子发布、损坏隔离、预算、去重、审计。
 - `client.js` —— **web 半**：由浏览器 module loader 惰性加载，用宿主提供的 React 渲染设置卡片。
 - `cordis.patch.yml` —— bundle 层，插入插件行。
 - `package.json` —— 在 `dsh` 键下声明 `dsh.bundle`（patch）与 `dsh.client`（inject 列表）。
 
-最快的开发循环：用 `file:` 把工作目录装进 profile（同上）——`index.js` 的修改在 profile 重启后生效。
+跑契约测试（并发、崩溃安全、损坏、预算、作用域隔离——零依赖，`node:test`）：
+
+```sh
+npm test
+```
+
+最快的开发循环：用 `file:` 把工作目录装进 profile（同上）——修改在 profile 重启后生效。
 
 ## 许可证
 

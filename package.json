@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-lite",
-  "version": "0.1.0",
-  "description": "Lightweight cross-session memory for DeepSeek Harness: one `memory` tool with save/recall/list/forget operations plus a Settings-card UI, persisted to ~/.dsh/memory-lite.json.",
+  "version": "0.2.0",
+  "description": "Lightweight cross-session memory for DeepSeek Harness: one `memory` tool with save/recall/list/forget operations plus a Settings-card UI. Scope-isolated by project directory, approval-gated writes, atomic durable storage with audit log, persisted to ~/.dsh/memory-lite.json.",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -13,6 +13,9 @@
     "memory",
     "agent-memory"
   ],
+  "scripts": {
+    "test": "node --test test/storage.test.js test/tool.test.js"
+  },
   "engines": {
     "node": ">=20"
   },
@@ -49,10 +52,12 @@
   },
   "files": [
     "index.js",
+    "storage.js",
     "client.js",
     "cordis.patch.yml",
     "README.md",
     "README.zh.md",
-    "LICENSE"
+    "LICENSE",
+    "test/"
   ]
 }
