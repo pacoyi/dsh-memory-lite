@@ -240,7 +240,7 @@ window.__ModuleLoader__.load({
                   } else {
                     setEdits({ ...edits, [i]: cand.text })
                   }
-                } }, edits[i] !== undefined ? '完成编辑' : '编辑')))),
+                } }, edits[i] !== undefined ? '完成编辑' : '编辑'))))),
           h('div', { className: 'mem-add' },
             h('input', {
               placeholder: '统一标签（可选，逗号分隔，应用到全部勾选条目）',
@@ -262,7 +262,7 @@ window.__ModuleLoader__.load({
               h('span', { className: 'mem-meta' }, `#${e.id} · ${scopeLabel(e.scope)}`),
               h('div', { className: 'mem-text' }, e.text)))),
           h('div', { className: 'mem-add' },
-            h('button', { className: 'mem-btn', onClick: onDone }, '完成')))))
+            h('button', { className: 'mem-btn', onClick: onDone }, '完成'))))
     }
 
     // Export panel: read-only render of the live entries as a plain
@@ -412,7 +412,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mem-add' },
             h('button', { className: 'mem-btn', onClick: () => setShowWiz(true) }, '导入'),
             h('button', { className: 'mem-btn', onClick: () => setShowExport(!showExport) }, '导出'),
-            h('button', { className: 'mem-btn', onClick: refresh, disabled: busy }, '刷新')),
+            h('button', { className: 'mem-btn', onClick: refresh, disabled: busy }, '刷新'))),
         err !== null && h('div', { className: 'mem-err' }, err),
         showExport && h(ExportPanel, {
           onClose: () => setShowExport(false),
@@ -472,7 +472,7 @@ window.__ModuleLoader__.load({
             h('button', {
               className: 'mem-act danger', onClick: () => purge(e.id), disabled: busy,
               title: confirmPurge === e.id ? '再次点击确认永久删除' : '永久删除（不可恢复）',
-            }, confirmPurge === e.id ? '确认永久删除?' : '永久删除')))))))
+            }, confirmPurge === e.id ? '确认永久删除?' : '永久删除'))))))
     }
 
     function apply(ctx) {

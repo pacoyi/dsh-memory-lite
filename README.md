@@ -109,7 +109,7 @@ This is a "two-half" dsh plugin:
 - `cordis.patch.yml` — the bundle layer that inserts the plugin row.
 - `package.json` — declares `dsh.bundle` (patch) and `dsh.client` (inject list) under the `dsh` key.
 
-Run the contract tests (concurrency, crash safety, audit reconciliation, corruption, budgets, scope isolation, import/export round-trip idempotency — zero dependencies, `node:test`):
+Run the contract tests (concurrency, crash safety, audit reconciliation, corruption, budgets, scope isolation, import/export round-trip idempotency — zero dependencies, `node:test`) plus a `client.js` render smoke suite (structure assertions for every card surface against a hook-mocked React — the layer RPC tests cannot see, where a stray `)` once swallowed the import result step without failing any syntax check):
 
 ```sh
 npm test

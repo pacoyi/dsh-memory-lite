@@ -109,7 +109,7 @@ web 客户端在**设置页**提供"记忆库"卡片：按作用域分组展示�
 - `cordis.patch.yml` —— bundle 层，插入插件行。
 - `package.json` —— 在 `dsh` 键下声明 `dsh.bundle`（patch）与 `dsh.client`（inject 列表）。
 
-跑契约测试（并发、崩溃安全、审计对账、损坏、预算、作用域隔离、导入/导出往返幂等——零依赖，`node:test`）：
+跑契约测试（并发、崩溃安全、审计对账、损坏、预算、作用域隔离、导入/导出往返幂等——零依赖，`node:test`）与 client.js 渲染冒烟套件（hook-mock React 下断言每张卡片的元素树结构——RPC 测试看不见的 UI 层；曾有一个多余的括号吞掉了导入结果页而不触发任何语法检查失败）：
 
 ```sh
 npm test
