@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-lite",
   "version": "0.3.0",
-  "description": "Cross-session memory for DeepSeek Harness: approval-gated `memory` tool (save/recall/list/forget) + Settings card to browse, add, delete (two-click, trash/restore). Scope-isolated, crash-safe store, audit log, zero deps. | DeepSeek Harness 跨会话记忆插件：审批门控 memory 工具 + 设置页「记忆库」卡片（查看/新增/删除、两击确认、回收站恢复）。项目作用域隔离、崩溃安全存储、全程审计、零依赖。",
+  "description": "Lightweight cross-session memory plugin for DeepSeek Harness: approval-gated `memory` tool (save/recall/list/forget) + Settings card UI to browse, add, delete (two-click, trash/restore) and idempotent import/export. | DeepSeek Harness 跨会话记忆插件：审批门控 memory 工具 + 设置页UI「记忆库」卡片（查看/新增/删除、两击确认、回收站恢复、导入/导出记忆——幂等迁移、冲突拒绝）。",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
