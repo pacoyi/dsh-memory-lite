@@ -1,6 +1,6 @@
 # dsh-memory-lite
 
-**[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的轻量跨会话记忆插件** —— 一个 `memory` 工具（save / recall / list / forget）+ 设置页"记忆库"卡片，带作用域隔离、写入审批、审计与崩溃安全存储。
+**[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的轻量跨会话记忆插件** —— 一个 `memory` 工具（save / recall / list / forget）+ 带**导入向导与导出面板**的设置页"记忆库"卡片，带作用域隔离、写入审批、审计与崩溃安全存储。
 
 [English](README.md) | 中文
 
@@ -50,7 +50,8 @@ dsh plugin --profile web add file:./dsh-memory-lite
 
 - `save` 与 `forget` 请求**宿主审批**（`tools/pre-execute` → ask）。web profile 中会弹出标准审批卡片；未组装审批通道的部署会拒绝这两个操作（fail closed，安全失败）。
 - 重放同一工具调用（如会话恢复后）**不会产生重复**条目——save 按调用 id 去重。
-- 每次变更向 `~/.dsh/.memory-lite.audit.jsonl` 追加一条持久记录：时间戳、操作、条目 id、作用域、来源（`agent` 或手动）、结果。
+- 每次变更以**双相审计**落盘：原子发布前先写一条 `pending` 意图行，发布后再补 `committed` 行。若进程死在两行之间，下次启动的**对账**会把孤儿意图关闭为显式的 `reconciled-applied` / `reconciled-orphan` 记录——审计链能检测并命名崩溃窗口，而不是静默缺失。
+- 审计记录在 `~/.dsh/.memory-lite.audit.jsonl`：时间戳、操作、存储版本号（rev）、阶段（phase）、条目 id、作用域、来源（`agent` / `user` / `import`）、结果。
 - `forget` 把条目移入**回收站**（可从设置卡片恢复）；永久删除是单独的、需确认的操作。
 
 ## 存储耐久性
@@ -80,21 +81,35 @@ dsh plugin --profile web add file:./dsh-memory-lite
 | `limit` | list/recall | 返回条数上限（默认 10，最大 100） |
 | `id` | forget | 要移入回收站的条目 id |
 
+## 导入向导（从其他 agent 迁移）
+
+设置卡片内置三步向导，用于从其他编码 agent 迁移精选记忆（Claude Code `CLAUDE.md`、Codex `AGENTS.md`，或任意粘贴文本）：
+
+1. **选择源** —— 自动探测常见文件（`~/.claude/CLAUDE.md`、`~/.codex/AGENTS.md`），或直接粘贴；选择目标作用域。
+2. **逐条策展** —— 源文本被切分为候选条目（markdown 列表、标题、段落；代码块跳过）。**规则样文本**（"必须"、"总是"、"must"、"always"…）会被标记且**默认不勾选**——每次必须执行的规则属于 Skill / 工作区指令，不属于语义记忆。你保留全部控制权：逐条编辑、勾选/取消、应用统一标签。
+3. **原子提交** —— 一批提交走同一套加锁引擎。勾选动作即人类批准（与手动保存同等地位——导入是一次性人类决策，永远不是模型工具）。
+
+重跑**幂等且冲突敏感**：每条导入条目携带溯源信息（源路径 + 文档/条目 digest）。重导入未变更的源会跳过已有条目；源文件*变更*后再从同路径导入会被**拒绝并报告冲突**——精选事实绝不会被静默覆盖或重复。
+
+### 导出
+
+同一张卡片带**导出**面板：把活跃条目（全库或单个作用域）渲染为纯 markdown 列表——只含内容与标签，不含 id/时间戳——复制到剪贴板。输出可直接粘进其他 agent 的记忆文件；粘回本插件的导入向导则是无操作：内容 digest 让"导出→导入"往返对任何来源的条目（`agent` / 手动 / 导入）都幂等。
+
 ## 设置页 UI
 
-web 客户端在**设置页**提供"记忆库"卡片：按作用域分组展示条目（含来源与时间戳）、两击确认删除、回收站视图（恢复 / 永久删除）。卡片能做的一切，直接编辑 `~/.dsh/memory-lite.json` 也都能做——但仅限 host 停止时，因为并发写归插件所有。
+web 客户端在**设置页**提供"记忆库"卡片：按作用域分组展示条目（含来源与时间戳）、两击确认删除、回收站视图（恢复 / 永久删除）、以及上述导入向导与导出面板。卡片能做的一切，直接编辑 `~/.dsh/memory-lite.json` 也都能做——但仅限 host 停止时，因为并发写归插件所有。
 
 ## 开发
 
 这是一个"双半"（two-half）dsh 插件：
 
-- `index.js` —— **agent 半**：注册 `memory` 工具、审批门与浏览器 RPC 桥。
-- `storage.js` —— 存储引擎：锁、原子发布、损坏隔离、预算、去重、审计。
+- `index.js` —— **agent 半**：注册 `memory` 工具、审批门、导入向导纯函数（解析 / 规则样分类 / 批次分类）与浏览器 RPC 桥。
+- `storage.js` —— 存储引擎：锁、原子发布、双相审计 + 启动对账、损坏隔离、预算、去重、批量导入。
 - `client.js` —— **web 半**：由浏览器 module loader 惰性加载，用宿主提供的 React 渲染设置卡片。
 - `cordis.patch.yml` —— bundle 层，插入插件行。
 - `package.json` —— 在 `dsh` 键下声明 `dsh.bundle`（patch）与 `dsh.client`（inject 列表）。
 
-跑契约测试（并发、崩溃安全、损坏、预算、作用域隔离——零依赖，`node:test`）：
+跑契约测试（并发、崩溃安全、审计对账、损坏、预算、作用域隔离、导入/导出往返幂等——零依赖，`node:test`）：
 
 ```sh
 npm test

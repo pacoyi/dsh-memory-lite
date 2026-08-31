@@ -6,7 +6,7 @@
 
 import { test, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, writeFile, rm, readdir } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, appendFile, rm, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFile } from 'node:child_process'
@@ -15,6 +15,7 @@ import { promisify } from 'node:util'
 import {
   LIMITS, GLOBAL_SCOPE, StoreCorruptError,
   paths, readStore, mutate, validateNote, allocateEntry, trashEntry, restoreEntry, purgeEntry,
+  importEntries, reconcileAudit,
 } from '../storage.js'
 
 const exec = promisify(execFile)
@@ -95,14 +96,19 @@ test('atomic publish: temp file never left behind, prior generation kept as .bak
   assert.equal(bak.entries[0].text, 'generation one')
 })
 
-test('audit log records every mutation durably', async () => {
+test('audit log records every mutation durably (two-phase pending/committed)', async () => {
   const e = await save('audited note')
   const raw = await readFile(paths().audit, 'utf8')
   const records = raw.trim().split('\n').map((l) => JSON.parse(l))
   const mine = records.filter((r) => r.op === 'save' && r.id === e.id)
-  assert.equal(mine.length, 1)
-  assert.equal(mine[0].outcome, 'committed')
+  assert.equal(mine.length, 2, 'one pending line plus one committed line per mutation')
+  assert.equal(mine[0].phase, 'pending')
+  assert.equal(mine[1].phase, 'committed')
+  assert.equal(mine[0].rev, mine[1].rev, 'both phases name the same store revision')
+  assert.equal(mine[1].outcome, 'committed')
   assert.ok(typeof mine[0].ts === 'string')
+  const store = await readStore()
+  assert.equal(store.rev, mine[1].rev, 'committed rev matches the persisted store')
 })
 
 test('corrupt store: quarantined once, reads and mutations fail closed', async () => {
@@ -210,4 +216,98 @@ test('store survives manual inspection: plain JSON, readable without the plugin'
   const raw = JSON.parse(await readFile(paths().store, 'utf8'))
   assert.equal(raw.entries[0].text, 'human readable')
   assert.equal(raw.entries[0].source, 'test')
+})
+
+test('reconcileAudit closes crash-orphaned pending intents (applied/orphan) and is idempotent', async () => {
+  await save('first')  // rev 1 — fully committed
+  await save('second') // rev 2 — fully committed
+  const p = paths()
+  // crash AFTER atomicSave but BEFORE the committed line: the store moved to
+  // rev 3, the audit trail stops at "pending 3"
+  const bumped = await readStore()
+  bumped.rev = 3
+  await writeFile(p.store, JSON.stringify(bumped, null, 2) + '\n', 'utf8')
+  await appendFile(p.audit, JSON.stringify({ ts: new Date().toISOString(), op: 'save', id: 99, phase: 'pending', rev: 3 }) + '\n', 'utf8')
+  // crash BEFORE atomicSave: pending 4 never landed anywhere
+  await appendFile(p.audit, JSON.stringify({ ts: new Date().toISOString(), op: 'save', id: 100, phase: 'pending', rev: 4 }) + '\n', 'utf8')
+
+  const result = await reconcileAudit()
+  assert.equal(result.reconciled, 1, 'rev 3 was applied but unproven')
+  assert.equal(result.orphaned, 1, 'rev 4 never applied')
+
+  const records = (await readFile(p.audit, 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
+  const closes = records.filter((r) => r.op === 'reconcile')
+  assert.deepEqual(closes.map((r) => [r.rev, r.applied]).sort(), [[3, true], [4, false]])
+  assert.ok(closes.every((r) => r.phase === 'reconciled'))
+
+  // idempotent: a second startup run closes nothing new and appends nothing
+  const linesBefore = (await readFile(p.audit, 'utf8')).trim().split('\n').length
+  const again = await reconcileAudit()
+  assert.equal(again.reconciled + again.orphaned, 0)
+  const linesAfter = (await readFile(p.audit, 'utf8')).trim().split('\n').length
+  assert.equal(linesAfter, linesBefore)
+})
+
+test('importEntries: atomic batch with provenance; one invalid item rejects all', async () => {
+  const prov = {
+    source_agent: 'claude-code', source_path: '/x/CLAUDE.md',
+    doc_digest: 'd1', item_digest: 'i1',
+    imported_at: new Date().toISOString(), importer_version: 1,
+  }
+  const imported = await mutate({ op: 'import', scope: GLOBAL_SCOPE, source: 'user' }, (store) => {
+    const entries = importEntries(store, [
+      { text: 'likes concise replies', scope: GLOBAL_SCOPE, provenance: prov },
+      { text: 'prefers dark theme', tags: ['ui'], scope: GLOBAL_SCOPE, provenance: { ...prov, item_digest: 'i2' } },
+    ])
+    return { result: entries, audit: { outcome: 'imported', count: entries.length } }
+  })
+  assert.deepEqual(imported.map((e) => e.id), [1, 2])
+  const store = await readStore()
+  assert.equal(store.entries[0].source, 'import')
+  assert.equal(store.entries[0].provenance.source_path, '/x/CLAUDE.md')
+  assert.equal(store.entries[0].trust, 'evidence')
+
+  // one invalid item rejects the whole batch — no partial import ever lands
+  await assert.rejects(
+    () => mutate({ op: 'import', scope: GLOBAL_SCOPE, source: 'user' }, (s) => {
+      importEntries(s, [
+        { text: 'ok entry', scope: GLOBAL_SCOPE },
+        { text: 'x'.repeat(LIMITS.noteChars + 1), scope: GLOBAL_SCOPE },
+      ])
+      return { result: null }
+    }),
+    /note exceeds/,
+  )
+  const store2 = await readStore()
+  assert.equal(store2.entries.length, 2, 'no partial import ever lands')
+
+  // empty batch and missing scope are refused outright
+  await assert.rejects(() => mutate({}, (s) => { importEntries(s, []); return { result: null } }), /non-empty/)
+  await assert.rejects(
+    () => mutate({}, (s) => { importEntries(s, [{ text: 'no scope' }]); return { result: null } }),
+    /scope/,
+  )
+})
+
+test('v2 store carrying provenance fields loads cleanly (additive compatibility)', async () => {
+  await writeFile(paths().store, JSON.stringify({
+    version: 2, rev: 7, next_id: 8,
+    entries: [{
+      id: 7, scope: GLOBAL_SCOPE, text: 'imported fact', tags: [], source: 'import',
+      trust: 'evidence',
+      provenance: {
+        source_agent: 'codex', source_path: '/y/AGENTS.md',
+        doc_digest: 'a', item_digest: 'b',
+        imported_at: '2026-08-31T00:00:00Z', importer_version: 1,
+      },
+      created_at: '2026-08-30T00:00:00Z', updated_at: '2026-08-30T00:00:00Z',
+    }],
+    trash: [], dedup: {},
+  }), 'utf8')
+  const store = await readStore()
+  assert.equal(store.entries[0].provenance.source_agent, 'codex')
+  // mutations keep working on top of the extended shape
+  const next = await save('after provenance load')
+  assert.equal(next.id, 8)
+  assert.equal((await readStore()).entries.length, 2)
 })

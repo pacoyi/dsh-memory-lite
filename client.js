@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     var module = { exports: {} }
     var exports = module.exports
     const React = require('react')
-    const { useState, useEffect, useCallback } = React
+    const { useState, useEffect, useCallback, useRef } = React
     const h = React.createElement
 
     let _ctx = null
@@ -45,6 +45,19 @@ window.__ModuleLoader__.load({
 .mem-empty { padding: 22px 0; text-align: center; font-size: 13px; color: var(--dsw-alias-label-tertiary); }
 .mem-err { padding: 8px 12px; border-radius: 8px; font-size: 12px; color: var(--dsw-alias-fill-danger, #e5484d); background: var(--dsw-alias-bg-layer-2); }
 .mem-trash-toggle { align-self: flex-start; font-size: 12px; color: var(--dsw-alias-label-secondary); background: none; border: none; cursor: pointer; padding: 2px 0; text-decoration: underline dotted; }
+.mem-wiz { display: flex; flex-direction: column; gap: 12px; padding: 14px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; background: var(--dsw-alias-bg-layer-2); }
+.mem-wiz-preset { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+.mem-wiz-preset-label { flex: 1 1 auto; overflow-wrap: anywhere; }
+.mem-wiz-miss { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
+.mem-wiz-note { font-size: 12px; color: var(--dsw-alias-fill-warn, #f5a524); }
+.mem-wiz-src { width: 100%; min-height: 120px; resize: vertical; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); font: inherit; font-size: 13px; box-sizing: border-box; }
+.mem-wiz-stat { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--dsw-alias-label-secondary); }
+.mem-wiz-stat-acts { display: flex; gap: 6px; }
+.mem-wiz-cand { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); }
+.mem-wiz-cand.rule { border-color: var(--dsw-alias-fill-warn, #f5a524); }
+.mem-wiz-cand input[type=checkbox] { flex: 0 0 auto; margin-top: 3px; }
+.mem-wiz-cand-body { flex: 1 1 auto; display: flex; flex-direction: column; gap: 4px; }
+.mem-wiz-cand-body textarea { width: 100%; min-height: 48px; resize: vertical; padding: 6px 8px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); font: inherit; font-size: 13px; box-sizing: border-box; }
     `
 
     function callRPC(method, args) {
@@ -80,6 +93,238 @@ window.__ModuleLoader__.load({
       return scope === 'global' ? '全局' : scope
     }
 
+    // Three-step import wizard: source (presets + paste) -> per-item
+    // curation with rule-like pre-unchecking -> result. A human-driven
+    // Settings-card flow — the checked items are the approval, and commit
+    // goes through the same locked engine as every other mutation.
+    function ImportWizard({ onClose, onDone, scopeOptions }) {
+      const [step, setStep] = useState('source')
+      const [presets, setPresets] = useState(null)
+      const [srcText, setSrcText] = useState('')
+      const [srcAgent, setSrcAgent] = useState('manual')
+      const [srcPath, setSrcPath] = useState(null) // null = free paste
+      const [scope, setScope] = useState('global')
+      const [candidates, setCandidates] = useState([])
+      const [docDigest, setDocDigest] = useState(null)
+      const [checks, setChecks] = useState({}) // idx -> checked
+      const [edits, setEdits] = useState({}) // idx -> edited text
+      const [batchTags, setBatchTags] = useState('')
+      const [result, setResult] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+
+      useEffect(() => {
+        callRPC('memory-lite/import.presets', {})
+          .then((d) => setPresets(d.presets ?? []))
+          .catch(() => setPresets([]))
+      }, [])
+
+      const usePreset = (p) => {
+        setSrcText(p.content ?? '')
+        setSrcAgent(p.agent)
+        setSrcPath(p.path)
+        setErr(null)
+      }
+
+      const parse = () => {
+        if (!srcText.trim() || busy) return
+        setBusy(true); setErr(null)
+        callRPC('memory-lite/import.parse', { text: srcText })
+          .then((d) => {
+            setCandidates(d.candidates ?? [])
+            setDocDigest(d.doc_digest ?? null)
+            const next = {}
+            ;(d.candidates ?? []).forEach((cand, i) => { if (!cand.rule_like) next[i] = true })
+            setChecks(next)
+            setEdits({})
+            setStep('preview')
+          })
+          .catch((e) => setErr(e.message))
+          .finally(() => setBusy(false))
+      }
+
+      const commit = () => {
+        const idxs = Object.keys(checks).filter((k) => checks[k]).map(Number).sort((a, b) => a - b)
+        if (idxs.length === 0 || busy) return
+        const tagList = batchTags.split(',').map((s) => s.trim()).filter(Boolean)
+        const items = idxs.map((i) => {
+          // edited text carries the original digest no more — drop it so the
+          // host classifies the fresh text by content instead of skipping it
+          const edited = edits[i] !== undefined
+          const merged = Array.from(new Set([...(candidates[i].tags ?? []), ...tagList]))
+          return {
+            text: edited ? edits[i] : candidates[i].text,
+            item_digest: edited ? undefined : candidates[i].item_digest,
+            tags: merged.length ? merged : undefined,
+          }
+        })
+        setBusy(true); setErr(null)
+        callRPC('memory-lite/import.commit', {
+          items, scope,
+          provenance: {
+            source_agent: srcAgent,
+            source_path: srcPath ?? undefined,
+            doc_digest: docDigest ?? undefined,
+          },
+        })
+          .then((r) => { setResult(r); setStep('result') })
+          .catch((e) => setErr(e.message))
+          .finally(() => setBusy(false))
+      }
+
+      const checkedCount = Object.values(checks).filter(Boolean).length
+      const ruleCount = candidates.filter((c) => c.rule_like).length
+
+      return h('div', { className: 'mem-wiz' },
+        h('div', { className: 'mem-header' },
+          h('div', null,
+            h('h3', { className: 'mem-title' }, '导入记忆'),
+            h('p', { className: 'mem-sub' },
+              step === 'source' ? '① 选择源 —— 探测其他 agent 的记忆文件，或直接粘贴'
+                : step === 'preview' ? '② 逐条勾选 —— 规则样文本默认不勾（规则更适合 Skill/工作区指令）'
+                  : '③ 完成 —— 结果与去向')),
+          h('button', { className: 'mem-btn', onClick: onClose, disabled: busy }, '关闭')),
+        err !== null && h('div', { className: 'mem-err' }, err),
+
+        step === 'source' && h('div', { className: 'mem-list' },
+          presets === null
+            ? h('div', { className: 'mem-empty' }, '探测常见记忆文件…')
+            : presets.map((p) => h('div', { key: p.path, className: 'mem-wiz-preset' },
+              h('span', { className: 'mem-wiz-preset-label' }, p.label),
+              p.error !== null && h('span', { className: 'mem-wiz-note' }, p.error),
+              p.error === null && !p.exists && h('span', { className: 'mem-wiz-miss' }, '未检出'),
+              p.exists && h('button', { className: 'mem-act', onClick: () => usePreset(p) },
+                `使用（${p.content.length} 字符）`))),
+          h('textarea', {
+            className: 'mem-wiz-src',
+            placeholder: '或直接粘贴记忆内容（CLAUDE.md / AGENTS.md 片段、纯文本清单…）',
+            value: srcText, onChange: (e) => { setSrcText(e.target.value); setSrcPath(null); setSrcAgent('manual') },
+          }),
+          h('div', { className: 'mem-add' },
+            h('select', { value: scope, onChange: (e) => setScope(e.target.value), title: '导入条目的目标作用域' },
+              scopeOptions.map((s) => h('option', { key: s, value: s }, scopeLabel(s)))),
+            h('button', { className: 'mem-btn', onClick: parse, disabled: busy || !srcText.trim() },
+              busy ? '解析中…' : '解析并预览'))),
+
+        step === 'preview' && h('div', null,
+          h('div', { className: 'mem-wiz-stat' },
+            h('span', null,
+              `共 ${candidates.length} 条候选 · 已勾选 ${checkedCount} 条`
+              + (ruleCount > 0 ? ` · ${ruleCount} 条疑似规则（默认未勾）` : '')),
+            h('span', { className: 'mem-wiz-stat-acts' },
+              h('button', { className: 'mem-act', onClick: () => {
+                const all = {}; candidates.forEach((_c, i) => { all[i] = true })
+                setChecks(all)
+              } }, '全选'),
+              h('button', { className: 'mem-act', onClick: () => setChecks({}) }, '清空'))),
+          h('div', { className: 'mem-list' },
+            candidates.map((cand, i) => h('div', { key: i, className: 'mem-wiz-cand' + (cand.rule_like ? ' rule' : '') },
+              h('input', {
+                type: 'checkbox', checked: !!checks[i],
+                onChange: (e) => setChecks({ ...checks, [i]: e.target.checked }),
+              }),
+              h('div', { className: 'mem-wiz-cand-body' },
+                edits[i] !== undefined
+                  ? h('textarea', {
+                    value: edits[i],
+                    onChange: (e) => setEdits({ ...edits, [i]: e.target.value }),
+                  })
+                  : h('div', { className: 'mem-text' }, cand.text),
+                cand.rule_like && h('div', { className: 'mem-wiz-note' },
+                  '指令/规则样文本 —— 若是每次必须执行的规则，更适合存 Skill 或工作区指令，而非语义记忆'),
+                h('button', { className: 'mem-act', onClick: () => {
+                  if (edits[i] !== undefined) {
+                    const next = { ...edits }; delete next[i]
+                    setEdits(next) // keep the edited text (empty edit falls back to the original)
+                    if (edits[i].trim()) setEdits({ ...next, [i]: edits[i] })
+                  } else {
+                    setEdits({ ...edits, [i]: cand.text })
+                  }
+                } }, edits[i] !== undefined ? '完成编辑' : '编辑')))),
+          h('div', { className: 'mem-add' },
+            h('input', {
+              placeholder: '统一标签（可选，逗号分隔，应用到全部勾选条目）',
+              value: batchTags, onChange: (e) => setBatchTags(e.target.value),
+            }),
+            h('button', { className: 'mem-btn', onClick: commit, disabled: busy || checkedCount === 0 },
+              busy ? '导入中…' : `导入 ${checkedCount} 条`),
+            h('button', { className: 'mem-btn', onClick: () => setStep('source'), disabled: busy }, '上一步'))),
+
+        step === 'result' && h('div', null,
+          h('div', { className: 'mem-wiz-stat' },
+            h('span', null,
+              `导入 ${(result?.imported ?? []).length} 条`
+              + ((result?.skipped_unchanged ?? []).length > 0 ? ` · 跳过 ${result.skipped_unchanged.length} 条（内容已存在）` : '')
+              + ((result?.conflicts ?? 0) > 0 ? ` · 冲突 ${result.conflicts} 条（源文件已变更，未导入）` : ''))),
+          result?.conflictReason && h('div', { className: 'mem-wiz-note' }, result.conflictReason),
+          (result?.imported ?? []).length > 0 && h('div', { className: 'mem-list' },
+            result.imported.map((e) => h('div', { key: e.id, className: 'mem-item' },
+              h('span', { className: 'mem-meta' }, `#${e.id} · ${scopeLabel(e.scope)}`),
+              h('div', { className: 'mem-text' }, e.text)))),
+          h('div', { className: 'mem-add' },
+            h('button', { className: 'mem-btn', onClick: onDone }, '完成')))))
+    }
+
+    // Export panel: read-only render of the live entries as a plain
+    // markdown list (whole store or one scope) with copy-to-clipboard. The
+    // output pastes into another agent's memory file and re-imports here
+    // losslessly — content digests make the round-trip a no-op.
+    function ExportPanel({ onClose, scopeOptions }) {
+      const [scope, setScope] = useState('all')
+      const [text, setText] = useState('')
+      const [count, setCount] = useState(0)
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const [copied, setCopied] = useState(false)
+      const taRef = useRef(null)
+
+      useEffect(() => {
+        setBusy(true); setErr(null); setCopied(false)
+        callRPC('memory-lite/export.render', { scope })
+          .then((d) => { setText(d.text ?? ''); setCount(d.count ?? 0) })
+          .catch((e) => setErr(e.message))
+          .finally(() => setBusy(false))
+      }, [scope])
+
+      const markCopied = () => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+      }
+      const copy = () => {
+        if (!text || busy) return
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(markCopied).catch(() => fallbackCopy())
+        } else fallbackCopy()
+      }
+      const fallbackCopy = () => {
+        if (taRef.current) {
+          taRef.current.select()
+          try { document.execCommand('copy'); markCopied() } catch (e) { setErr('复制失败——请手动全选复制') }
+        }
+      }
+
+      return h('div', { className: 'mem-wiz' },
+        h('div', { className: 'mem-header' },
+          h('div', null,
+            h('h3', { className: 'mem-title' }, '导出记忆'),
+            h('p', { className: 'mem-sub' },
+              '纯 markdown 列表——可粘到其他 agent 的记忆文件，也可粘回导入向导（重导入自动跳过已有条目）')),
+          h('button', { className: 'mem-btn', onClick: onClose, disabled: busy }, '关闭')),
+        err !== null && h('div', { className: 'mem-err' }, err),
+        h('div', { className: 'mem-add' },
+          h('select', { value: scope, onChange: (e) => setScope(e.target.value), title: '导出的作用域范围' },
+            [h('option', { key: 'all', value: 'all' }, '全部作用域')].concat(
+              scopeOptions.map((s) => h('option', { key: s, value: s }, scopeLabel(s)))))),
+        h('textarea', {
+          ref: taRef, className: 'mem-wiz-src', readOnly: true,
+          value: busy ? '渲染中…' : (text || '（该范围暂无条目）'),
+        }),
+        h('div', { className: 'mem-wiz-stat' },
+          h('span', null, `${count} 条 · 只含内容与标签，不含 id/来源/时间戳`),
+          h('button', { className: 'mem-btn', onClick: copy, disabled: busy || count === 0 },
+            copied ? '已复制 ✓' : '复制到剪贴板')))
+    }
+
     function MemoryPanel() {
       const [data, setData] = useState(null) // { entries, trash }
       const [text, setText] = useState('')
@@ -90,6 +335,8 @@ window.__ModuleLoader__.load({
       const [confirmDel, setConfirmDel] = useState(null) // entry id awaiting second click
       const [confirmPurge, setConfirmPurge] = useState(null)
       const [showTrash, setShowTrash] = useState(false)
+      const [showWiz, setShowWiz] = useState(false)
+      const [showExport, setShowExport] = useState(false)
 
       useEffect(() => {
         if (confirmDel === null) return undefined
@@ -162,9 +409,23 @@ window.__ModuleLoader__.load({
             h('h3', { className: 'mem-title' }, '记忆库'),
             h('p', { className: 'mem-sub' },
               `${count} 条活跃 · ${trash.length} 条回收站 · 按项目目录隔离 · agent 写入需审批 · 全部变更记入审计日志`)),
-          h('button', { className: 'mem-btn', onClick: refresh, disabled: busy }, '刷新')),
+          h('div', { className: 'mem-add' },
+            h('button', { className: 'mem-btn', onClick: () => setShowWiz(true) }, '导入'),
+            h('button', { className: 'mem-btn', onClick: () => setShowExport(!showExport) }, '导出'),
+            h('button', { className: 'mem-btn', onClick: refresh, disabled: busy }, '刷新')),
         err !== null && h('div', { className: 'mem-err' }, err),
-        h('div', { className: 'mem-add' },
+        showExport && h(ExportPanel, {
+          onClose: () => setShowExport(false),
+          scopeOptions: scopeOrder,
+        }),
+        showWiz
+          ? h(ImportWizard, {
+            onClose: () => setShowWiz(false),
+            onDone: () => { setShowWiz(false); refresh() },
+            scopeOptions: scopeOrder,
+          })
+          : h('div', null,
+            h('div', { className: 'mem-add' },
           h('textarea', {
             placeholder: '新增一条记忆（自包含、具体）…', value: text,
             onChange: (e) => setText(e.target.value),
@@ -211,7 +472,7 @@ window.__ModuleLoader__.load({
             h('button', {
               className: 'mem-act danger', onClick: () => purge(e.id), disabled: busy,
               title: confirmPurge === e.id ? '再次点击确认永久删除' : '永久删除（不可恢复）',
-            }, confirmPurge === e.id ? '确认永久删除?' : '永久删除')))))
+            }, confirmPurge === e.id ? '确认永久删除?' : '永久删除')))))))
     }
 
     function apply(ctx) {

@@ -10,18 +10,26 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply } from '../index.js'
+import { readStore } from '../storage.js'
 
 let dir
 let toolDef
 let preExecuteHandler
+let rpcHandler
 
 function mockContext() {
   return {
     tools: { register: (def) => { toolDef = def } },
     on: (event, handler) => { preExecuteHandler = handler },
-    inject: () => {},
+    inject: (_deps, cb) => {
+      // capture the connection RPC surface so tests can drive the
+      // settings-card endpoints (list/save/forget/.../import.*) directly
+      cb({ connection: { rpc: { handle: (_channel, fn) => { rpcHandler = fn } } } })
+    },
   }
 }
+
+const rpc = (endpoint, payload) => rpcHandler(endpoint, payload)
 
 let callSeq = 0
 const execIn = (cwd, callId) => ({
@@ -138,4 +146,179 @@ test('render output respects the character budget', async () => {
   const text = toolDef.output.render({}, value)[0].text
   assert.ok(text.length <= 16000 + 200, `rendered ${text.length} chars`)
   assert.match(text, /output truncated/)
+})
+
+test('recall render labels imported entries with their source path', async () => {
+  const entry = {
+    id: 42, scope: 'global', text: 'imported fact', tags: [], source: 'import',
+    trust: 'evidence', created_at: '2026-08-31T00:00:00Z',
+    provenance: { source_path: '/src/CLAUDE.md' },
+  }
+  const lines = toolDef.output.render({}, { operation: 'recall', entries: [entry] })[0].text
+  assert.match(lines, /untrusted evidence/)
+  assert.match(lines, /imported from \/src\/CLAUDE\.md/)
+  assert.match(lines, / · import · /)
+})
+
+test('import.parse: lists, headings, paragraphs, fences, dedupe, rule-like flags', async () => {
+  const src = [
+    '# 代码风格',
+    '- 用户偏好中文回复',
+    '* 提交前必须运行全部测试',
+    '1. 使用 pnpm 管理依赖',
+    '  续行也算同一条',
+    '',
+    '零散段落：项目 A 用 React 18 构建。',
+    '```bash',
+    '- 这行在代码块里必须被忽略',
+    '```',
+    '- Never commit secrets to git',
+    '- 用户偏好中文回复',
+  ].join('\n')
+  const res = await rpc('import.parse', { text: src })
+  assert.equal(res.ok, true)
+  const { candidates, doc_digest } = res.value
+  const texts = candidates.map((c) => c.text)
+  assert.ok(texts.includes('代码风格'), 'heading stands alone as a candidate')
+  assert.ok(texts.includes('用户偏好中文回复'))
+  assert.ok(texts.includes('使用 pnpm 管理依赖 续行也算同一条'), 'indented continuation merges into its list item')
+  assert.ok(texts.some((t) => t.includes('零散段落')), 'paragraph fallback works')
+  assert.ok(texts.includes('Never commit secrets to git'))
+  assert.ok(!texts.some((t) => t.includes('代码块里')), 'fenced code blocks are skipped')
+  assert.equal(texts.filter((t) => t === '用户偏好中文回复').length, 1, 'duplicates deduped')
+
+  const ruleZh = candidates.find((c) => c.text === '提交前必须运行全部测试')
+  assert.equal(ruleZh.rule_like, true, 'Chinese imperative flagged')
+  const ruleEn = candidates.find((c) => c.text === 'Never commit secrets to git')
+  assert.equal(ruleEn.rule_like, true, 'English never-flagged imperative flagged')
+  const fact = candidates.find((c) => c.text === '用户偏好中文回复')
+  assert.equal(fact.rule_like, false, 'plain preference not flagged')
+  assert.ok(fact.item_digest, 'per-item digest present')
+  assert.ok(doc_digest, 'document digest present')
+
+  // empty source surfaces as an RPC error, not a crash
+  const bad = await rpc('import.parse', { text: '   ' })
+  assert.equal(bad.ok, false)
+  assert.match(bad.error.message, /nothing to parse/)
+})
+
+test('import.commit: provenance roundtrip, idempotent re-run, conflict refusal', async () => {
+  const prov = { source_agent: 'claude-code', source_path: '/src/CLAUDE.md' }
+  const parsed = await rpc('import.parse', { text: '- 用户偏好中文回复\n- 喜欢深色主题' })
+  const { candidates, doc_digest } = parsed.value
+  const items = candidates.map((c) => ({ text: c.text, item_digest: c.item_digest }))
+
+  const first = await rpc('import.commit', { items, scope: 'global', provenance: { ...prov, doc_digest } })
+  assert.equal(first.ok, true)
+  assert.equal(first.value.imported.length, 2)
+  assert.equal(first.value.imported[0].source, 'import')
+  assert.equal(first.value.imported[0].provenance.source_path, '/src/CLAUDE.md')
+  assert.equal(first.value.imported[0].provenance.doc_digest, doc_digest)
+  assert.ok(first.value.imported[0].provenance.imported_at)
+
+  // re-running the exact same import is a no-op
+  const rerun = await rpc('import.commit', { items, scope: 'global', provenance: { ...prov, doc_digest } })
+  assert.equal(rerun.value.imported.length, 0)
+  assert.equal(rerun.value.skipped_unchanged.length, 2)
+  const store = await readStore()
+  assert.equal(store.entries.filter((e) => e.source === 'import').length, 2)
+
+  // the same path with a CHANGED document is refused — never silently overwritten
+  const beforeCount = store.entries.length
+  const changed = await rpc('import.parse', { text: '- 用户改为偏好英文回复' })
+  const conflict = await rpc('import.commit', {
+    items: changed.value.candidates.map((c) => ({ text: c.text, item_digest: c.item_digest })),
+    scope: 'global',
+    provenance: { ...prov, doc_digest: changed.value.doc_digest },
+  })
+  assert.equal(conflict.ok, true, 'a conflict is a structured result, not an error')
+  assert.equal(conflict.value.conflicts, 2)
+  assert.equal(conflict.value.imported.length, 0)
+  assert.match(conflict.value.conflictReason, /changed/)
+  const store2 = await readStore()
+  assert.equal(store2.entries.length, beforeCount, 'nothing landed from the conflicting batch')
+})
+
+test('import.commit: pasted source dedupes by item digest without path conflicts', async () => {
+  const parsed = await rpc('import.parse', { text: '- 喜欢简短回复' })
+  const mk = (p) => p.value.candidates.map((c) => ({ text: c.text, item_digest: c.item_digest }))
+  const a = await rpc('import.commit', { items: mk(parsed), scope: 'global' })
+  assert.equal(a.value.imported.length, 1)
+
+  // same paste again: no real path, so no document-level conflict — but the
+  // identical content still skips by item digest
+  const again = await rpc('import.commit', { items: mk(parsed), scope: 'global' })
+  assert.equal(again.value.imported.length, 0)
+  assert.equal(again.value.skipped_unchanged.length, 1)
+  assert.equal(again.value.conflicts, 0)
+
+  // a different paste lands normally
+  const other = await rpc('import.parse', { text: '- 项目 B 使用 vitest' })
+  const d = await rpc('import.commit', { items: mk(other), scope: 'global' })
+  assert.equal(d.value.imported.length, 1)
+
+  // empty selection is an RPC error
+  const empty = await rpc('import.commit', { items: [], scope: 'global' })
+  assert.equal(empty.ok, false)
+  assert.match(empty.error.message, /no items selected/)
+})
+
+test('import.presets probes well-known files and returns structured results', async () => {
+  const res = await rpc('import.presets', {})
+  assert.equal(res.ok, true)
+  assert.ok(Array.isArray(res.value.presets))
+  assert.ok(res.value.presets.length >= 2, 'both claude-code and codex presets probed')
+  for (const p of res.value.presets) {
+    assert.equal(typeof p.path, 'string')
+    assert.equal(typeof p.exists, 'boolean')
+    if (p.exists) {
+      assert.equal(typeof p.content, 'string')
+      assert.equal(typeof p.doc_digest, 'string')
+      assert.equal(p.error, null)
+    }
+  }
+})
+
+test('export.render: scope filtering renders a plain markdown list', async () => {
+  const store = await readStore()
+  const all = await rpc('export.render', {})
+  assert.equal(all.ok, true)
+  assert.equal(all.value.count, store.entries.length)
+  assert.ok(all.value.text.includes('- project A fact'), 'entries render as list items')
+  assert.ok(!/#[0-9]+/.test(all.value.text), 'no ids leak into the export')
+
+  const global = await rpc('export.render', { scope: 'global' })
+  assert.equal(global.value.count, store.entries.filter((e) => e.scope === 'global').length)
+  assert.ok(global.value.text.includes('dark theme'))
+  assert.ok(!global.value.text.includes('project B secret'), 'other scopes stay out')
+
+  const projA = await rpc('export.render', { scope: '/proj/a' })
+  assert.ok(projA.value.text.includes('project A fact'))
+  assert.ok(!projA.value.text.includes('dark theme'))
+  assert.equal(projA.value.count, store.entries.filter((e) => e.scope === '/proj/a').length)
+})
+
+test('export -> parse -> commit round-trip is a no-op for every entry source', async () => {
+  // a manual save WITH tags exercises the (tags: ...) suffix round-trip
+  const withTags = await rpc('save', { text: '用 vitest 跑测试', tags: ['tooling'], scope: 'global' })
+  assert.equal(withTags.ok, true)
+
+  const exported = await rpc('export.render', {})
+  assert.ok(exported.value.text.includes('(tags: tooling)'), 'tags render as the round-trip suffix')
+
+  const parsed = await rpc('import.parse', { text: exported.value.text })
+  const tagged = parsed.value.candidates.find((c) => c.text === '用 vitest 跑测试')
+  assert.deepEqual(tagged.tags, ['tooling'], 'parse recovers the suffix as tags')
+
+  const committed = await rpc('import.commit', {
+    items: parsed.value.candidates.map((c) => ({ text: c.text, item_digest: c.item_digest, tags: c.tags })),
+    scope: 'global',
+    provenance: { source_agent: 'manual' },
+  })
+  assert.equal(committed.ok, true)
+  assert.equal(committed.value.imported.length, 0,
+    'every live entry — agent, user, import — skips on re-import (content digest, not just provenance)')
+  assert.equal(committed.value.skipped_unchanged.length, exported.value.count)
+  const store = await readStore()
+  assert.equal(store.entries.length, exported.value.count, 'nothing duplicated by the round-trip')
 })

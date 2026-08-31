@@ -1,6 +1,6 @@
 # dsh-memory-lite
 
-**Lightweight cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)** — one `memory` tool (save / recall / list / forget) plus a Settings "记忆库" card, with scope isolation, approval-gated writes, and an audited, crash-safe store.
+**Lightweight cross-session memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)** — one `memory` tool (save / recall / list / forget) plus a Settings "记忆库" card with an import wizard and export panel, scope isolation, approval-gated writes, and an audited, crash-safe store.
 
 English | [中文](README.zh.md)
 
@@ -50,7 +50,8 @@ Restart the profile (`dsh --profile web`) and the `memory` tool is live.
 
 - `save` and `forget` request **host approval** (`tools/pre-execute` → ask). In the web profile this shows the standard approval card; a deployment without an approval channel denies both operations (fail closed).
 - Replaying the same tool call (e.g. after a session resume) **does not duplicate** the entry — saves are deduplicated by call id.
-- Every mutation appends a durable record to `~/.dsh/.memory-lite.audit.jsonl`: timestamp, operation, entry id, scope, source (`agent` or manual), outcome.
+- Every mutation is audited in **two durable phases**: a `pending` intent line is written before the atomic store publish, a `committed` line after. If the process dies in between, the next startup's **reconciliation** closes the orphaned intent into an explicit `reconciled-applied` / `reconciled-orphan` record — the audit trail can detect and name a crash window instead of silently missing it.
+- Audit records live in `~/.dsh/.memory-lite.audit.jsonl`: timestamp, operation, store revision, phase, entry id, scope, source (`agent` / `user` / `import`), outcome.
 - `forget` moves entries to a **trash list** (restorable from the Settings card); permanent deletion is a separate, confirmed action.
 
 ## Storage durability
@@ -80,21 +81,35 @@ The tool schema it uses:
 | `limit` | list/recall | Max entries to return (default 10, max 100) |
 | `id` | forget | The entry id to move to trash |
 
+## Import wizard (migration from other agents)
+
+The Settings card ships a three-step wizard for migrating curated memories from other coding agents (Claude Code `CLAUDE.md`, Codex `AGENTS.md`, or any pasted text):
+
+1. **Source** — well-known files (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`) are probed automatically, or paste anything. Choose the destination scope.
+2. **Curate** — the source is split into candidate entries (markdown lists, headings, paragraphs; fenced code blocks are skipped). **Rule-like text** ("must", "always", "必须"…) is flagged and **unchecked by default** — rules that must be followed every time belong in Skills / workspace instructions, not semantic memory. You keep full control: edit any item, check or uncheck, apply shared tags.
+3. **Commit** — one atomic batch through the same locked engine. The checked items are the human approval (same standing as manual saves — import is a one-time human decision, never a model tool).
+
+Re-runs are **idempotent and conflict-aware**: each entry carries provenance (source path + document/item digests). Re-importing an unchanged source skips already-imported items; importing the same path after the source *changed* is **refused with a conflict report** — curated facts are never silently overwritten or duplicated.
+
+### Export
+
+The same card carries an **export** panel: render the live entries (whole store or one scope) as a plain markdown list — content and tags only, no ids or timestamps — and copy it to the clipboard. The output pastes cleanly into another agent's memory file, and re-importing it here is a no-op: content digests make export → import round-trips idempotent for every entry, whatever its source (`agent`, manual, or imported).
+
 ## Settings UI
 
-The web client ships a "记忆库" card in **Settings**: entries grouped by scope with source and timestamps, two-click delete confirmation, a trash view with restore / permanent-delete. Everything the card can do, editing `~/.dsh/memory-lite.json` directly can also do — but only while the host is stopped, since the plugin owns concurrent writes.
+The web client ships a "记忆库" card in **Settings**: entries grouped by scope with source and timestamps, two-click delete confirmation, a trash view with restore / permanent-delete, and the import wizard and export panel above. Everything the card can do, editing `~/.dsh/memory-lite.json` directly can also do — but only while the host is stopped, since the plugin owns concurrent writes.
 
 ## Development
 
 This is a "two-half" dsh plugin:
 
-- `index.js` — the **agent half**: registers the `memory` tool, the approval gate, and the browser RPC bridge.
-- `storage.js` — the storage engine: locking, atomic publish, quarantine, budgets, dedup, audit.
+- `index.js` — the **agent half**: registers the `memory` tool, the approval gate, the import-wizard pure helpers (parse / rule-like classification / batch classification), and the browser RPC bridge.
+- `storage.js` — the storage engine: locking, atomic publish, two-phase audit + startup reconciliation, quarantine, budgets, dedup, batch import.
 - `client.js` — the **web half**: lazy-loaded by the browser module loader, renders the Settings card with host-provided React.
 - `cordis.patch.yml` — the bundle layer that inserts the plugin row.
 - `package.json` — declares `dsh.bundle` (patch) and `dsh.client` (inject list) under the `dsh` key.
 
-Run the contract tests (concurrency, crash safety, corruption, budgets, scope isolation — zero dependencies, `node:test`):
+Run the contract tests (concurrency, crash safety, audit reconciliation, corruption, budgets, scope isolation, import/export round-trip idempotency — zero dependencies, `node:test`):
 
 ```sh
 npm test

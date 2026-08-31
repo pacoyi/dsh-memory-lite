@@ -5,6 +5,10 @@
  * Store format (v2, human-readable JSON):
  *   { version, rev, next_id, entries: [], trash: [], dedup: {} }
  * Entry shape: { id, scope, text, tags, source, trust, created_at, updated_at }
+ *   — imported entries additionally carry a provenance object
+ *     { source_agent, source_path, doc_digest, item_digest, imported_at,
+ *       importer_version } used for idempotent re-runs (optional, additive:
+ *     older plugin versions simply never see it)
  *
  * Guarantees (see README "Storage durability"):
  * - all mutations serialize through one in-process queue AND a cross-process
@@ -15,7 +19,11 @@
  *   corruption is quarantined (evidence copy) and ALL mutations fail closed;
  * - ids come from a persistent next_id counter and are never reused;
  * - note / tag / entry-count / file-byte budgets are enforced before write;
- * - every mutation appends one durable JSONL audit record;
+ * - every mutation is audited in TWO durable phases: a pending intent line
+ *   before the atomic publish, a committed line after. A crash in between
+ *   leaves a pending line that reconcileAudit() closes into an explicit
+ *   reconciled-applied / reconciled-orphan outcome at startup — the audit
+ *   gap is detected and named, never silent;
  * - same rootCallId saves deduplicate through a bounded FIFO window.
  */
 
@@ -259,13 +267,20 @@ export async function readStore() {
  * Run one mutation under the full contract: in-process queue, cross-process
  * lock, locked read-modify-write, atomic publish, durable audit record.
  *
+ * The audit is two-phase: the pending intent line (with the target rev) is
+ * durable BEFORE atomicSave, the committed line after. If the process dies
+ * between the two, the store on disk already carries rev N while the audit
+ * trail stops at "pending N" — reconcileAudit() turns that into an explicit
+ * outcome on the next startup instead of leaving an unverifiable change.
+ *
  * @param {object} audit  base audit record (op/scope/source/…) — the executor
  *   appends id/outcome facts.
  * @param {(store: object) => {result: unknown, audit?: object}} mutator
  *   pure transform: receives the loaded store, returns the tool result value
  *   plus optional extra audit fields. MUST NOT mutate the store in place
  *   beyond what it intends to persist — the engine persists whatever the
- *   store object looks like on return.
+ *   store object looks like on return. A thrown error aborts before any
+ *   durable effect (no store write, no audit line).
  */
 export async function mutate(audit, mutator) {
   return enqueue(async () => {
@@ -274,12 +289,71 @@ export async function mutate(audit, mutator) {
       const { store } = await loadRaw()
       const { result, audit: extra } = await mutator(store)
       store.rev = (store.rev ?? 0) + 1
+      await appendAudit({ ...audit, ...extra, phase: 'pending', rev: store.rev })
       await atomicSave(store)
-      await appendAudit({ ...audit, ...extra })
+      await appendAudit({ ...audit, ...extra, phase: 'committed', rev: store.rev })
       return result
     } finally {
       await release()
     }
+  })
+}
+
+// How many trailing audit lines reconciliation scans — every mutation writes
+// two lines, so this covers ~1000 recent mutations; older ones are closed
+// implicitly (a pending line only stays open until the next same-rev commit).
+const RECONCILE_WINDOW = 2000
+
+/**
+ * Close out pending audit intents left by a crash: for every revision whose
+ * last phase line is still 'pending', compare the persisted store rev and
+ * append an explicit reconciliation record — reconciled-applied (the write
+ * landed but the committed line never did) or reconciled-orphan (the intent
+ * never landed). Purely additive to the audit log; never touches the store.
+ * Pre-v0.3 audit lines carry no rev/phase and are ignored.
+ *
+ * @returns {{checked: number, reconciled: number, orphaned: number}}
+ */
+export async function reconcileAudit() {
+  return enqueue(async () => {
+    const p = paths()
+    let raw
+    try {
+      raw = await readFile(p.audit, 'utf8')
+    } catch (err) {
+      if (err.code === 'ENOENT') return { checked: 0, reconciled: 0, orphaned: 0 }
+      throw err
+    }
+    const lines = raw.split('\n').filter((l) => l.trim())
+    const records = []
+    for (const line of lines.slice(-RECONCILE_WINDOW)) {
+      try { records.push(JSON.parse(line)) } catch { /* torn tail line — skip */ }
+    }
+    // A rev is open while its last phase line is 'pending'; 'committed' or
+    // 'reconciled' closes it. Tracking open revs (instead of last phases)
+    // keeps reconciliation itself idempotent across repeated startups.
+    const openRevs = new Set()
+    for (const r of records) {
+      if (typeof r.rev !== 'number') continue
+      if (r.phase === 'pending') openRevs.add(r.rev)
+      else if (r.phase === 'committed' || r.phase === 'reconciled') openRevs.delete(r.rev)
+    }
+    const openRev = [...openRevs].sort((a, b) => a - b)
+    if (openRev.length === 0) return { checked: records.length, reconciled: 0, orphaned: 0 }
+    const { store } = await loadRaw()
+    let reconciled = 0
+    let orphaned = 0
+    for (const rev of openRev) {
+      const applied = (store.rev ?? 0) >= rev
+      await appendAudit({
+        op: 'reconcile', phase: 'reconciled', rev,
+        outcome: applied ? 'reconciled-applied' : 'reconciled-orphan',
+        applied,
+      })
+      if (applied) reconciled += 1
+      else orphaned += 1
+    }
+    return { checked: records.length, reconciled, orphaned }
   })
 }
 
@@ -330,6 +404,55 @@ export function allocateEntry(store, { text, tags, scope, source, rootCallId }) 
     throw new Error(`memory store is full (${LIMITS.maxEntries} entries); forget some entries first`)
   }
   return { entry }
+}
+
+/**
+ * Import a batch of curated entries in one atomic mutation. Every item is
+ * validated first — one invalid item rejects the whole batch, so the wizard
+ * preview is the commit contract (all-or-nothing). Items carry provenance
+ * (source_path + digests) used by the caller for idempotent re-runs.
+ *
+ * @param {object} store
+ * @param {Array<{text: string, tags?: string[], scope: string, provenance?: object}>} items
+ * @returns {Array<object>} the freshly allocated entries
+ */
+export function importEntries(store, items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error('import requires a non-empty items array')
+  }
+  for (const item of items) {
+    if (typeof item?.scope !== 'string' || !item.scope.trim()) {
+      throw new Error('import item rejected: scope must be a non-empty string')
+    }
+    if (item.provenance !== undefined && (typeof item.provenance !== 'object' || Array.isArray(item.provenance))) {
+      throw new Error('import item rejected: provenance must be an object')
+    }
+    const errors = validateNote(item.text, item.tags)
+    if (errors.length) throw new Error(`import item rejected: ${errors.join('; ')}`)
+  }
+  if (store.entries.length + items.length > LIMITS.maxEntries) {
+    throw new Error(`import would exceed the ${LIMITS.maxEntries} entry budget ` +
+      `(${store.entries.length} live + ${items.length} incoming); forget some entries first`)
+  }
+  const now = new Date().toISOString()
+  const imported = []
+  for (const item of items) {
+    const entry = {
+      id: store.next_id,
+      scope: item.scope,
+      text: item.text.trim(),
+      tags: item.tags?.map((t) => t.trim()) ?? [],
+      source: 'import',
+      trust: 'evidence',
+      provenance: item.provenance,
+      created_at: now,
+      updated_at: now,
+    }
+    store.next_id += 1
+    store.entries.push(entry)
+    imported.push(entry)
+  }
+  return imported
 }
 
 /** Move an entry to trash (soft delete with undo), evicting the oldest trash. */
