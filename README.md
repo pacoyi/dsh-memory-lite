@@ -108,6 +108,7 @@ This is a "two-half" dsh plugin:
 - `client.js` — the **web half**: lazy-loaded by the browser module loader, renders the Settings card with host-provided React.
 - `cordis.patch.yml` — the bundle layer that inserts the plugin row.
 - `package.json` — declares `dsh.bundle` (patch) and `dsh.client` (inject list) under the `dsh` key.
+- `SPEC.md` — maintainer spec: requirements, security-contract traceability, design decisions, version history (Chinese).
 
 Run the contract tests (concurrency, crash safety, audit reconciliation, corruption, budgets, scope isolation, import/export round-trip idempotency — zero dependencies, `node:test`) plus a `client.js` render smoke suite (structure assertions for every card surface against a hook-mocked React — the layer RPC tests cannot see, where a stray `)` once swallowed the import result step without failing any syntax check):
 

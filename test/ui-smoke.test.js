@@ -209,10 +209,13 @@ test('ExportPanel renders scope select, preview area, and copy affordance', () =
 
 // Real-React renderToString smoke: proves no render path throws (the
 // ReferenceError white-screen class). Optional — skipped when the harness
-// checkout (or MEMORY_LITE_REACT_DIR) is not around.
+// checkout (or MEMORY_LITE_REACT_DIR) is not around. The sibling checkout is
+// derived from this file's location (repo root → ../deepseek-harness), so no
+// machine-specific absolute paths are embedded.
 const REACT_DIR_CANDIDATES = [
   process.env.MEMORY_LITE_REACT_DIR,
-  '/Users/pacomacpro/Downloads/DeepSeekHarness/deepseek-harness/apps/web/node_modules',
+  // repo root → up two levels (workspace) → sibling harness checkout
+  join(dirname(CLIENT), '..', '..', 'deepseek-harness', 'apps', 'web', 'node_modules'),
 ].filter(Boolean)
 
 function resolveRealReact() {
